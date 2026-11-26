@@ -1,0 +1,17 @@
+services:
+  ci-builder:
+    build: .
+    image: ci-incremental-builder:latest
+    container_name: ci-incremental-builder
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /data
+      CC: gcc
+      BUILD_WORKERS: "4"
+    volumes:
+      - ci-cache:/data
+    restart: unless-stopped
+
+volumes:
+  ci-cache:
