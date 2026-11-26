@@ -19,6 +19,8 @@ import json
 import os
 import posixpath
 import threading
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -86,7 +88,12 @@ class Store:
 
 
 class KeyedLocks:
-    """按缓存键分锁：不同对象并行编译，同一对象全局串行。"""
+    """按缓存键分锁：不同对象并行编译，同一对象全局串行。
+
+    ``acquire_many`` 按缓存键的字典序依次加锁，所有构建都遵循同一全局
+    顺序，因此不会出现“A 持 k1 等 k2、B 持 k2 等 k1”的死锁；互不相交的
+    键集合之间互不阻塞。
+    """
 
     def __init__(self) -> None:
         self._master = threading.Lock()
@@ -99,3 +106,11 @@ class KeyedLocks:
                 lock = threading.Lock()
                 self._locks[key] = lock
             return lock
+
+    @contextmanager
+    def acquire_many(self, keys: list[str] | set[str]) -> Iterator[None]:
+        """一次性持有整组缓存键锁，直到 with 块结束。"""
+        with ExitStack() as stack:
+            for key in sorted(set(keys)):
+                stack.enter_context(self.get(key))
+            yield

@@ -61,6 +61,10 @@ class BuildRecord(BaseModel):
     units: list[UnitStatus]
     error: str | None = None
     download_path: str | None = None
+    publish_warnings: list[str] = Field(
+        default_factory=list,
+        description="链接成功但个别对象写入共享缓存失败时的告警（不影响构建结果）",
+    )
 
 
 class CacheEntry(BaseModel):

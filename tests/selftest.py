@@ -21,6 +21,8 @@ from pathlib import Path
 import httpx
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 PASS = 0
 FAIL = 0
 
@@ -50,7 +52,9 @@ def wait_health(base: str, timeout: float = 30.0) -> None:
     raise RuntimeError(f"server did not become healthy: {last}")
 
 
-def spawn_server() -> tuple[str, tempfile.TemporaryDirectory, subprocess.Popen]:
+def spawn_server(extra_env: dict | None = None) -> tuple[
+    str, tempfile.TemporaryDirectory, subprocess.Popen
+]:
     data_dir = tempfile.mkdtemp(prefix="cibuild-data-")
     port = free_port()
     base = f"http://127.0.0.1:{port}"
@@ -58,6 +62,8 @@ def spawn_server() -> tuple[str, tempfile.TemporaryDirectory, subprocess.Popen]:
     env["DATA_DIR"] = data_dir
     env["BUILD_WORKERS"] = "4"
     env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    if extra_env:
+        env.update(extra_env)
     proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "app.main:app",
          "--host", "127.0.0.1", "--port", str(port)],
@@ -159,7 +165,11 @@ def main() -> int:
         scenario_indirect_header(base, work)
         scenario_header_shadow(base, work)
         scenario_failure_keeps_cache(base, work)
+        scenario_link_failure_no_publish(base, work)
+        scenario_compile_failure_cold(base, work)
         scenario_concurrency_dedup(base, work)
+        scenario_disjoint_keys_parallel(base, work)
+        scenario_overlapping_keys(base, work)
         scenario_snapshot_isolation(base, work)
     finally:
         if proc is not None:
@@ -333,10 +343,189 @@ def scenario_failure_keeps_cache(base: str, work: Path) -> None:
 
 
 # --------------------------------------------------------------------- #
-# 场景 6：并发相同构建只编译一次，且全部成功
+# 场景 6：链接失败不发布对象；修正后仅由失败构建编过的对象重编
+# --------------------------------------------------------------------- #
+def link_failure_project() -> dict:
+    # main.c 引用未定义符号 g：两个源文件都能编译，但链接失败。
+    return {
+        "files": [
+            {"path": "lf/util.h",
+             "content": "#ifndef LF_H\n#define LF_H\nint f(int x);\n#endif\n"},
+            {"path": "lf/util.c",
+             "content": '#include "util.h"\nint f(int x){return x + 1;}\n'},
+            {"path": "lf/main.c",
+             "content": '#include <stdio.h>\n#include "util.h"\n'
+                        "int main(void){printf(\"r=%d\\n\", g(41));return 0;}\n"},
+        ],
+        "include_dirs": ["lf"],
+        "program_name": "lf",
+    }
+
+
+def scenario_link_failure_no_publish(base: str, work: Path) -> None:
+    print("\n[6] 链接失败后不发布新对象，修正后仅重编失败构建编过的对象")
+    proj = link_failure_project()
+    cache_before = {e["cache_key"] for e in httpx.get(f"{base}/api/cache").json()}
+
+    bad = wait_build(base, submit(base, proj)["build_id"])
+    check("链接失败状态为 failed", bad["status"] == "failed")
+    check("错误信息来自链接器", "link failed" in (bad.get("error") or ""))
+    check("链接失败无下载链接", bad["download_path"] is None)
+    cache_after = {e["cache_key"] for e in httpx.get(f"{base}/api/cache").json()}
+    check("链接失败构建未新增任何缓存槽", cache_after == cache_before,
+          f"new={sorted(cache_after - cache_before)}")
+
+    # 只修 main.c；util.c 内容与失败构建时完全相同，但它从未成功发布。
+    proj["files"][2]["content"] = (
+        '#include <stdio.h>\n#include "util.h"\n'
+        "int main(void){printf(\"r=%d\\n\", f(41));return 0;}\n"
+    )
+    fixed = wait_build(base, submit(base, proj)["build_id"])
+    check("修正后构建成功", fixed["status"] == "succeeded", fixed.get("error"))
+    check("失败构建编过的 util.c 必须重编",
+          unit(fixed, "lf/util.c")["status"] == "compiled")
+    check("修正的 main.c 也重编",
+          unit(fixed, "lf/main.c")["status"] == "compiled")
+    check("产物输出 r=42",
+          run_prog(download(base, fixed, work / "lf1")).strip() == "r=42")
+
+    # 再次提交同样源码：现在两个对象都已发布，全部复用旧缓存。
+    again = wait_build(base, submit(base, proj)["build_id"])
+    check("成功后再提交全部复用",
+          all(u["status"] == "reused" for u in again["units"]))
+
+    # 已发布的旧缓存 + 链接失败：旧对象照常复用，新编对象不发布。
+    warm = {
+        "files": [
+            {"path": "lf2/util.h",
+             "content": "#ifndef LF2_H\n#define LF2_H\nint f(int x);\n#endif\n"},
+            {"path": "lf2/util.c",
+             "content": '#include "util.h"\nint f(int x){return x + 2;}\n'},
+            {"path": "lf2/main.c",
+             "content": '#include <stdio.h>\n#include "util.h"\n'
+                        "int main(void){printf(\"w=%d\\n\", f(40));return 0;}\n"},
+        ],
+        "include_dirs": ["lf2"],
+        "program_name": "lf2",
+    }
+    good = wait_build(base, submit(base, warm)["build_id"])
+    check("预热构建成功", good["status"] == "succeeded", good.get("error"))
+    good_keys = {u["source"]: u["cache_key"] for u in good["units"]}
+    cache_before = {e["cache_key"] for e in httpx.get(f"{base}/api/cache").json()}
+
+    broken = json_clone(warm)
+    broken["files"][2]["content"] = (
+        '#include <stdio.h>\n#include "util.h"\n'
+        "int main(void){printf(\"%d\\n\", nope());return 0;}\n"
+    )
+    bad = wait_build(base, submit(base, broken)["build_id"])
+    check("预热后链接失败", bad["status"] == "failed"
+          and "link failed" in (bad.get("error") or ""))
+    check("失败构建复用已发布的旧 util.c 缓存",
+          unit(bad, "lf2/util.c")["status"] == "reused"
+          and unit(bad, "lf2/util.c")["cache_key"] == good_keys["lf2/util.c"])
+    cache_after = {e["cache_key"] for e in httpx.get(f"{base}/api/cache").json()}
+    check("失败构建新编的 main.c 未发布、旧缓存仍在",
+          cache_after == cache_before, f"new={sorted(cache_after - cache_before)}")
+    check("旧缓存对象仍在缓存列表中",
+          good_keys["lf2/util.c"] in cache_after)
+
+    back = wait_build(base, submit(base, warm)["build_id"])
+    check("回退后旧缓存照常全部复用",
+          all(u["status"] == "reused" for u in back["units"])
+          and {u["source"]: u["cache_key"] for u in back["units"]} == good_keys)
+    check("回退产物输出 w=42",
+          run_prog(download(base, back, work / "lf2")).strip() == "w=42")
+
+
+# --------------------------------------------------------------------- #
+# 场景 7：冷缓存下某单元编译失败，同构建其他成功编译的单元也不发布
+# --------------------------------------------------------------------- #
+def scenario_compile_failure_cold(base: str, work: Path) -> None:
+    print("\n[7] 编译失败时同批成功单元也不发布，修正后全部重编")
+    # 独立路径：确保冷缓存，不被其他场景发布过的同内容对象干扰。
+    proj = {
+        "files": [
+            {"path": "cf/util.h",
+             "content": "#ifndef CF_H\n#define CF_H\nint f(int x);\n#endif\n"},
+            {"path": "cf/util.c",
+             "content": '#include "util.h"\nint f(int x){return x + 1;}\n'},
+            {"path": "cf/main.c",
+             "content": "#include <stdio.h>\nint main(void){broken}\n"},
+        ],
+        "include_dirs": ["cf"],
+        "program_name": "cf",
+    }
+    cache_before = {e["cache_key"] for e in httpx.get(f"{base}/api/cache").json()}
+    bad = wait_build(base, submit(base, proj)["build_id"])
+    check("编译失败状态为 failed", bad["status"] == "failed")
+    check("同批 util.c 在失败构建中确实编译成功",
+          unit(bad, "cf/util.c")["status"] == "compiled")
+    cache_after = {e["cache_key"] for e in httpx.get(f"{base}/api/cache").json()}
+    check("同批 util.c 编译成功但未发布", cache_after == cache_before,
+          f"new={sorted(cache_after - cache_before)}")
+
+    proj["files"][2]["content"] = (
+        '#include <stdio.h>\n#include "util.h"\n'
+        "int main(void){printf(\"c=%d\\n\", f(1));return 0;}\n"
+    )
+    fixed = wait_build(base, submit(base, proj)["build_id"])
+    check("修正后构建成功", fixed["status"] == "succeeded", fixed.get("error"))
+    check("两个单元都重编",
+          all(u["status"] == "compiled" for u in fixed["units"]),
+          [(u["source"], u["status"]) for u in fixed["units"]])
+    check("产物输出 c=2",
+          run_prog(download(base, fixed, work / "cf1")).strip() == "c=2")
+
+
+def write_cc_wrapper(path: Path, log: Path, sleep_s: float = 0.0) -> Path:
+    """生成记录 gcc 调用的包装器；用于统计编译次数与调用区间。"""
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, subprocess, sys, time\n"
+        "log = os.environ['CC_LOG']\n"
+        "args = sys.argv[1:]\n"
+        "if '--version' in args:\n"
+        "    sys.exit(subprocess.call(['/usr/bin/gcc', *args]))\n"
+        "kind = 'link' if '-c' not in args else 'compile'\n"
+        "with open(log, 'a') as fh:\n"
+        "    fh.write(f'start {kind} {time.time_ns()} {\" \".join(args)}\\n')\n"
+        "if kind == 'compile':\n"
+        "    time.sleep(float(os.environ.get('CC_SLEEP', '0')))\n"
+        "rc = subprocess.call(['/usr/bin/gcc', *args])\n"
+        "with open(log, 'a') as fh:\n"
+        "    fh.write(f'end {kind} {time.time_ns()} {\" \".join(args)}\\n')\n"
+        "sys.exit(rc)\n"
+    )
+    path.chmod(0o755)
+    return path
+
+
+def wrapper_calls(log: Path, kind: str) -> list[tuple[int, int, str]]:
+    """解析包装器日志，返回 (开始 ns, 结束 ns, 参数) 列表。"""
+    open_at: dict[str, int] = {}
+    calls: list[tuple[int, int, str]] = []
+    for line in log.read_text().splitlines():
+        status, k, ns, args = line.split(" ", 3)
+        if k != kind:
+            continue
+        if status == "start":
+            open_at[args] = int(ns)
+        else:
+            calls.append((open_at.pop(args), int(ns), args))
+    return calls
+
+
+# --------------------------------------------------------------------- #
+# 场景 8：并发相同构建只编译一次，且全部成功
 # --------------------------------------------------------------------- #
 def scenario_concurrency_dedup(base: str, work: Path) -> None:
-    print("\n[6] 并发构建去重（同一缓存键全局只编译一次）")
+    print("\n[8] 并发构建去重（同一缓存键全局只编译一次）")
+    log = work / "dedup-cc.log"
+    wrapper = write_cc_wrapper(work / "dedup-cc.py", log)
+    base2, tmp2, proc2 = spawn_server(
+        extra_env={"CC": str(wrapper), "CC_LOG": str(log), "BUILD_WORKERS": "8"}
+    )
     # 用独有路径保证冷缓存，不被前序场景预热的缓存干扰。
     proj = {
         "files": [
@@ -352,36 +541,183 @@ def scenario_concurrency_dedup(base: str, work: Path) -> None:
         "program_name": "cc",
     }
     n = 8
-    ids = [submit(base, proj)["build_id"] for _ in range(n)]
-    recs = [wait_build(base, bid) for bid in ids]
-    check("8 个并发构建全部成功", all(r["status"] == "succeeded" for r in recs))
+    try:
+        ids = [submit(base2, proj)["build_id"] for _ in range(n)]
+        recs = [wait_build(base2, bid) for bid in ids]
+        check("8 个并发构建全部成功", all(r["status"] == "succeeded" for r in recs))
 
-    compiled = sum(1 for r in recs for u in r["units"] if u["status"] == "compiled")
-    reused = sum(1 for r in recs for u in r["units"] if u["status"] == "reused")
-    check("仅 2 个对象真正编译，其余 14 个复用", compiled == 2 and reused == 2 * (n - 1),
-          f"compiled={compiled} reused={reused}")
+        compiled = sum(1 for r in recs for u in r["units"] if u["status"] == "compiled")
+        reused = sum(1 for r in recs for u in r["units"] if u["status"] == "reused")
+        check("仅 2 个对象真正编译，其余 14 个复用",
+              compiled == 2 and reused == 2 * (n - 1),
+              f"compiled={compiled} reused={reused}")
 
-    keys = {(u["source"], u["cache_key"]) for r in recs for u in r["units"]}
-    check("同源缓存键全局一致", len(keys) == 2)
+        gcc_compiles = wrapper_calls(log, "compile")
+        gcc_links = wrapper_calls(log, "link")
+        check("GCC 编译调用恰好 2 次（每个未缓存对象仅一次）",
+              len(gcc_compiles) == 2, f"compile_calls={len(gcc_compiles)}")
+        check("8 次构建各自完成链接", len(gcc_links) == n,
+              f"link_calls={len(gcc_links)}")
 
-    cache = httpx.get(f"{base}/api/cache").json()
-    check("缓存中每个编译单元仅一份",
-          len([e for e in cache if e["source"].startswith("cc_dedup/")]) == 2)
+        keys = {(u["source"], u["cache_key"]) for r in recs for u in r["units"]}
+        check("同源缓存键全局一致", len(keys) == 2)
 
-    for i, r in enumerate(recs):
-        out = run_prog(download(base, r, work / f"cc{i}"))
-        if out.strip() != "d=42":
-            check(f"并发产物 {i} 可运行", False, out)
-            break
-    else:
-        check("8 个并发产物均可运行且输出正确", True)
+        cache = httpx.get(f"{base2}/api/cache").json()
+        check("缓存中每个编译单元仅一份",
+              len([e for e in cache if e["source"].startswith("cc_dedup/")]) == 2)
+
+        for i, r in enumerate(recs):
+            out = run_prog(download(base2, r, work / f"cc{i}"))
+            if out.strip() != "d=42":
+                check(f"并发产物 {i} 可运行", False, out)
+                break
+        else:
+            check("8 个并发产物均可运行且输出正确", True)
+    finally:
+        proc2.terminate()
+        try:
+            proc2.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc2.kill()
 
 
 # --------------------------------------------------------------------- #
-# 场景 7：并发不同提交各用各的快照，产物互不串
+# 场景 9：缓存键互不相交的并发构建可同时编译
+# --------------------------------------------------------------------- #
+def scenario_disjoint_keys_parallel(base: str, work: Path) -> None:
+    print("\n[9] 缓存键互不相交的构建可同时编译")
+    from app.storage import KeyedLocks  # 锁语义的进程内直测
+    import threading
+    import time as _time
+
+    locks = KeyedLocks()
+    order: list[str] = []
+
+    def hold(keys: list[str], tag: str, hold_s: float) -> None:
+        with locks.acquire_many(keys):
+            with lock_span:
+                order.append(f"{tag}-in")
+            _time.sleep(hold_s)
+            with lock_span:
+                order.append(f"{tag}-out")
+
+    lock_span = threading.Lock()  # 仅保护 order，避免误判
+
+    t1 = threading.Thread(target=hold, args=(["k1", "k2"], "A", 0.35))
+    t2 = threading.Thread(target=hold, args=(["k3", "k4"], "B", 0.35))
+    start = _time.monotonic()
+    t1.start(); t2.start(); t1.join(); t2.join()
+    elapsed = _time.monotonic() - start
+    check("互不相交键集合并行持锁（耗时约单段而非两段）", elapsed < 0.6,
+          f"elapsed={elapsed:.3f}s")
+    check("两线程的持锁区间重叠",
+          len(order) == 4 and order[0].endswith("-in")
+          and order[1].endswith("-in"), f"order={order}")
+
+    # 真实构建：给编译器加 1s 延迟并记录起止时间，检查两个不同工程
+    # 的 gcc 调用区间确实重叠（说明未因全局锁而串行）。
+    log = work / "cc.log"
+    wrapper = write_cc_wrapper(work / "slowcc.py", log)
+    base2, tmp2, proc2 = spawn_server(
+        extra_env={"CC": str(wrapper), "CC_LOG": str(log), "CC_SLEEP": "1.0"}
+    )
+    try:
+        def single(tag: str) -> dict:
+            return {
+                "files": [{
+                    "path": f"par/{tag}.c",
+                    "content": '#include <stdio.h>\n'
+                               f'int main(void){{printf("{tag}\\n");return 0;}}\n',
+                }],
+                "program_name": tag,
+            }
+        ids = {tag: submit(base2, single(tag))["build_id"] for tag in ("aa", "bb")}
+        recs = {tag: wait_build(base2, bid) for tag, bid in ids.items()}
+        check("两个不同工程并发均成功",
+              all(r["status"] == "succeeded" for r in recs.values()))
+        both = all(
+            run_prog(download(base2, r, work / f"par-{tag}")).strip() == tag
+            for tag, r in recs.items()
+        )
+        check("两份产物均可下载运行", both)
+
+        # 两次 gcc -c 属于不同缓存键，其调用区间应当重叠。
+        spans = [(s, e) for s, e, args in wrapper_calls(log, "compile")]
+        check("两次 gcc -c 调用时间区间重叠",
+              len(spans) == 2
+              and max(spans[0][0], spans[1][0]) < min(spans[0][1], spans[1][1]),
+              f"spans={spans}")
+    finally:
+        proc2.terminate()
+        try:
+            proc2.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc2.kill()
+
+
+# --------------------------------------------------------------------- #
+# 场景 10：部分键重叠的并发构建不死锁，共享对象只编译一次
+# --------------------------------------------------------------------- #
+def scenario_overlapping_keys(base: str, work: Path) -> None:
+    print("\n[10] 部分键重叠的并发构建（同序加锁、共享对象只编一次）")
+    log = work / "ov-cc.log"
+    wrapper = write_cc_wrapper(work / "ov-cc.py", log)
+    base2, tmp2, proc2 = spawn_server(
+        extra_env={"CC": str(wrapper), "CC_LOG": str(log), "CC_SLEEP": "0.4"}
+    )
+    # A 与 B 共享 common.c/common.h；各自另有独有源文件。
+    common = [
+        {"path": "ov/common.h",
+         "content": "#ifndef OV_H\n#define OV_H\nint common(int x);\n#endif\n"},
+        {"path": "ov/common.c",
+         "content": '#include "common.h"\nint common(int x){return x + 1;}\n'},
+    ]
+    def proj(tag: str) -> dict:
+        return {
+            "files": common + [
+                {"path": f"ov/{tag}.c",
+                 "content": '#include <stdio.h>\n#include "common.h"\n'
+                            f"int main(void){{printf(\"{tag}:%d\\n\", common(1));"
+                            "return 0;}\n"},
+            ],
+            "include_dirs": ["ov"],
+            "program_name": tag,
+        }
+    try:
+        ids = {tag: submit(base2, proj(tag))["build_id"] for tag in ("pa", "pb")}
+        # 两次提交几乎同时进入构建；若加锁顺序不一致可能死锁，这里给足超时。
+        try:
+            recs = {tag: wait_build(base2, bid, timeout=90)
+                    for tag, bid in ids.items()}
+        except TimeoutError:
+            check("重叠键并发未死锁", False, "timeout waiting for builds")
+            return
+        check("重叠键并发双方均成功",
+              all(r["status"] == "succeeded" for r in recs.values()),
+              {t: r.get("error") for t, r in recs.items()})
+        outputs = {t: run_prog(download(base2, r, work / f"ov-{t}")).strip()
+                   for t, r in recs.items()}
+        check("产物与提交对应", outputs == {"pa": "pa:2", "pb": "pb:2"}, outputs)
+
+        compiled = sum(1 for r in recs.values() for u in r["units"]
+                       if u["status"] == "compiled")
+        check("共享对象 + 两个独有对象，编译调用恰好 3 次", compiled == 3,
+              f"compiled={compiled}")
+        check("GCC 编译调用恰好 3 次", len(wrapper_calls(log, "compile")) == 3,
+              f"calls={len(wrapper_calls(log, 'compile'))}")
+    finally:
+        proc2.terminate()
+        try:
+            proc2.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc2.kill()
+
+
+# --------------------------------------------------------------------- #
+# 场景 11：并发不同提交各用各的快照，产物互不串
 # --------------------------------------------------------------------- #
 def scenario_snapshot_isolation(base: str, work: Path) -> None:
-    print("\n[7] 并发不同提交的快照隔离")
+    print("\n[11] 并发不同提交的快照隔离")
     def proj(value: int) -> dict:
         return {
             "files": [

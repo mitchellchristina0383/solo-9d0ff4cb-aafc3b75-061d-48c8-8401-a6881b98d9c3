@@ -41,6 +41,20 @@ class UnitResult:
     object_path: str | None = None
     included_headers: list[str] = field(default_factory=list)
     error: str | None = None
+    # 仅在本次构建中真正调用 GCC 成功时填写；链接成功后据此发布缓存。
+    publish_meta: dict | None = field(default=None, repr=False)
+
+
+@dataclass
+class UnitPlan:
+    """加锁前算好的编译计划：缓存键在构建开始时就固定。"""
+
+    source: str
+    headers: list[IncludedFile]
+    cache_key: str
+    command: list[str]
+    meta: dict
+    work_obj: Path
 
 
 class BuildError(Exception):
@@ -106,10 +120,24 @@ class IncrementalBuilder:
             "units": [],
             "error": None,
             "download_path": None,
+            "publish_warnings": [],
         }
 
     def build_in(self, build_id: str, spec: BuildRequestSpec) -> dict:
-        """在指定构建目录中执行构建，全程使用该目录内的源码快照。"""
+        """在指定构建目录中执行构建，全程使用该目录内的源码快照。
+
+        缓存发布严格放在链接成功之后：
+
+        1. 先为每个单元计算缓存键与编译命令（不触碰共享缓存）；
+        2. 按缓存键全局有序地一次性持锁，锁内查缓存、编译缺失对象；
+        3. 全部单元编译成功后才链接；
+        4. 链接成功后，才把本次真正新编译的对象发布到共享缓存。
+
+        编译或链接失败时整批都不发布。于是并发提交同一工程时，后来的
+        构建会等前一个持锁构建完成：成功则直接复用其刚发布的对象（每个
+        未缓存对象只调用一次 GCC），失败则自己重新编译；而缓存键互不相交
+        的构建之间不共享任何锁，可同时编译。
+        """
         record = self._placeholder(build_id, spec)
         self._persist(record)
 
@@ -117,32 +145,23 @@ class IncrementalBuilder:
             sources = self._stage_sources(build_id, spec)
             src_dir = self.store.build_src_dir(build_id)
             resolver = IncludeResolver(src_dir, spec.include_dirs)
+            plans = self._plan_units(build_id, sources, resolver, spec)
 
-            # 每个编译单元独立计算缓存键并尝试复用；线程池提供构建间并发。
-            with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
-                unit_futures = {
-                    pool.submit(
-                        self._process_unit, build_id, src_rel, resolver, spec
-                    ): src_rel
-                    for src_rel in sources
-                }
-                units: list[UnitResult] = []
-                for future in unit_futures:
-                    units.append(future.result())
+            with self.locks.acquire_many({p.cache_key for p in plans}):
+                units = self._build_units(plans)
+                record["units"] = [self._unit_to_dict(u) for u in units]
+                record["files"] = self._file_statuses(src_dir, sources, units)
 
-            # 稳定顺序，便于阅读与测试。
-            order = {s: i for i, s in enumerate(sources)}
-            units.sort(key=lambda u: order[u.source])
-            record["units"] = [self._unit_to_dict(u) for u in units]
-            record["files"] = self._file_statuses(src_dir, sources, units)
+                failed = next((u for u in units if u.status == "failed"), None)
+                if failed is not None:
+                    raise BuildError(
+                        f"compilation failed for {failed.source}: {failed.error}"
+                    )
 
-            failed = next((u for u in units if u.status == "failed"), None)
-            if failed is not None:
-                raise BuildError(
-                    f"compilation failed for {failed.source}: {failed.error}"
-                )
+                self._link(build_id, units)
+                # 链接成功是发布的前提；失败构建（编译或链接）不写任何缓存槽。
+                record["publish_warnings"] = self._publish_new_objects(units)
 
-            self._link(build_id, units, spec)
             record["status"] = "succeeded"
             record["download_path"] = f"/api/builds/{build_id}/download"
         except BuildError as exc:
@@ -183,51 +202,26 @@ class IncrementalBuilder:
         return rel.endswith((".c", ".cc", ".cpp", ".cxx"))
 
     # ------------------------------------------------------------------ #
-    # 单编译单元：缓存键 + 互斥编译/复用
+    # 编译计划：加锁前确定缓存键与命令
     # ------------------------------------------------------------------ #
-    def _process_unit(
+    def _plan_units(
         self,
         build_id: str,
-        src_rel: str,
+        sources: list[str],
         resolver: IncludeResolver,
         spec: BuildRequestSpec,
-    ) -> UnitResult:
+    ) -> list[UnitPlan]:
         src_dir = self.store.build_src_dir(build_id)
-        src_abs = src_dir / src_rel
-        headers = resolver.closure(src_rel)
-        source_hash = sha256_file(src_abs)
-        cache_key = self._cache_key(src_rel, source_hash, headers, spec)
-
-        work_obj = self.store.build_work_dir(build_id) / (src_rel + ".o")
-        work_obj.parent.mkdir(parents=True, exist_ok=True)
-
-        # 同一缓存键全局串行：并发构建里只有第一个真正调用 GCC。
-        lock = self.locks.get(cache_key)
-        with lock:
-            slot = self.store.object_slot(cache_key)
-            cached_obj = slot / "object.o"
-            if cached_obj.is_file():
-                self._materialize(cached_obj, work_obj)
-                return UnitResult(
-                    source=src_rel,
-                    status="reused",
-                    cache_key=cache_key,
-                    object_path=str(work_obj),
-                    included_headers=[h.rel_path for h in headers],
-                )
-
-            cmd = self._compile_command(src_abs, work_obj, src_dir, spec)
-            proc = subprocess.run(cmd, capture_output=True, text=True)
-            if proc.returncode != 0:
-                # 失败绝不写缓存槽：其他构建与后续重试仍可使用旧缓存。
-                return UnitResult(
-                    source=src_rel,
-                    status="failed",
-                    cache_key=cache_key,
-                    error=(proc.stderr or proc.stdout or "gcc failed").strip(),
-                    included_headers=[h.rel_path for h in headers],
-                )
-
+        work_dir = self.store.build_work_dir(build_id)
+        plans: list[UnitPlan] = []
+        for src_rel in sources:
+            src_abs = src_dir / src_rel
+            headers = resolver.closure(src_rel)
+            source_hash = sha256_file(src_abs)
+            cache_key = self._cache_key(src_rel, source_hash, headers, spec)
+            work_obj = work_dir / (src_rel + ".o")
+            work_obj.parent.mkdir(parents=True, exist_ok=True)
+            command = self._compile_command(src_abs, work_obj, src_dir, spec)
             meta = {
                 "cache_format_version": CACHE_FORMAT_VERSION,
                 "source": src_rel,
@@ -238,16 +232,82 @@ class IncrementalBuilder:
                 "headers": [
                     {"path": h.rel_path, "sha256": h.sha256} for h in headers
                 ],
-                "command": cmd,
+                "command": command,
             }
-            self._publish_object(slot, work_obj, meta)
-            return UnitResult(
-                source=src_rel,
-                status="compiled",
-                cache_key=cache_key,
-                object_path=str(work_obj),
-                included_headers=[h.rel_path for h in headers],
+            plans.append(
+                UnitPlan(
+                    source=src_rel,
+                    headers=headers,
+                    cache_key=cache_key,
+                    command=command,
+                    meta=meta,
+                    work_obj=work_obj,
+                )
             )
+        return plans
+
+    # ------------------------------------------------------------------ #
+    # 单元编译：在整簇缓存键锁内查缓存 / 调用 GCC
+    # ------------------------------------------------------------------ #
+    def _build_units(self, plans: list[UnitPlan]) -> list[UnitResult]:
+        if not plans:
+            return []
+        # 同一构建内各单元缓存键互不相同（键含源路径），可并行编译。
+        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+            return list(pool.map(self._compile_or_reuse, plans))
+
+    def _compile_or_reuse(self, plan: UnitPlan) -> UnitResult:
+        slot = self.store.object_slot(plan.cache_key)
+        cached_obj = slot / "object.o"
+        # meta.json 最后写入，两者齐备才代表一次完整发布；缺失则重编。
+        if cached_obj.is_file() and (slot / "meta.json").is_file():
+            # 已发布的缓存（含并发成功构建刚发布的同键对象）直接复用。
+            self._materialize(cached_obj, plan.work_obj)
+            return UnitResult(
+                source=plan.source,
+                status="reused",
+                cache_key=plan.cache_key,
+                object_path=str(plan.work_obj),
+                included_headers=[h.rel_path for h in plan.headers],
+            )
+
+        proc = subprocess.run(plan.command, capture_output=True, text=True)
+        if proc.returncode != 0:
+            # 失败绝不写缓存槽：其他构建与后续重试仍可使用旧缓存。
+            return UnitResult(
+                source=plan.source,
+                status="failed",
+                cache_key=plan.cache_key,
+                error=(proc.stderr or proc.stdout or "gcc failed").strip(),
+                included_headers=[h.rel_path for h in plan.headers],
+            )
+
+        return UnitResult(
+            source=plan.source,
+            status="compiled",
+            cache_key=plan.cache_key,
+            object_path=str(plan.work_obj),
+            included_headers=[h.rel_path for h in plan.headers],
+            publish_meta=plan.meta,
+        )
+
+    def _publish_new_objects(self, units: list[UnitResult]) -> list[str]:
+        """链接成功后发布本次真正编译出的对象；返回发布失败的告警。"""
+        warnings: list[str] = []
+        for u in units:
+            if u.status != "compiled" or u.publish_meta is None or u.object_path is None:
+                continue
+            try:
+                self._publish_object(
+                    self.store.object_slot(u.cache_key),
+                    Path(u.object_path),
+                    u.publish_meta,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # 链接与产物均已完成；发布失败只影响后续复用，不应把一次
+                # 成功的构建改判为失败，故只记录告警。
+                warnings.append(f"publish {u.source} -> {u.cache_key}: {exc!r}")
+        return warnings
 
     def _cache_key(
         self,
@@ -290,9 +350,15 @@ class IncrementalBuilder:
         self, slot: Path, work_obj: Path, meta: dict
     ) -> None:
         slot.mkdir(parents=True, exist_ok=True)
-        tmp_obj = slot / "object.o.tmp"
-        shutil.copy2(work_obj, tmp_obj)
-        os.replace(tmp_obj, slot / "object.o")
+        # 临时文件名带进程内唯一后缀：发布阶段虽持键锁，仍避免任何同槽
+        # 临时名撞车；先写对象、后写 meta，meta 存在即代表对象完整。
+        tmp_obj = slot / f"object.o.tmp.{uuid.uuid4().hex}"
+        try:
+            shutil.copy2(work_obj, tmp_obj)
+            os.replace(tmp_obj, slot / "object.o")
+        finally:
+            if tmp_obj.is_file():
+                tmp_obj.unlink(missing_ok=True)
         self.store.write_json_atomic(slot / "meta.json", meta)
 
     @staticmethod
@@ -306,9 +372,7 @@ class IncrementalBuilder:
     # ------------------------------------------------------------------ #
     # 链接
     # ------------------------------------------------------------------ #
-    def _link(
-        self, build_id: str, units: list[UnitResult], spec: BuildRequestSpec
-    ) -> None:
+    def _link(self, build_id: str, units: list[UnitResult]) -> None:
         objects = [Path(u.object_path) for u in units]
         program = self.store.build_program_path(build_id)
         cmd = [self.compiler, *[str(o) for o in objects], "-o", str(program)]
